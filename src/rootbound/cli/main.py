@@ -16,6 +16,7 @@ def scan(
     path: str = typer.Argument(..., help="Path to execution entrypoint file or directory"),
     output: Optional[str] = typer.Option(None, "--output", "-o", help="Write packages list to requirements.txt-like file"),
     show_chains: bool = typer.Option(False, "--show-chains", help="Show exact import trace chains"),
+    show_sources: bool = typer.Option(False, "--show-sources", help="Show immediate files importing each dependency"),
     json_output: bool = typer.Option(False, "--json", help="Output results in JSON format"),
 ):
     """Scan an entrypoint file or directory to list out unique external dependencies."""
@@ -48,6 +49,14 @@ def scan(
             console.print(f"📦 [cyan]{pkg}[/cyan]")
             for chain in result.import_chains.get(pkg, []):
                 console.print("  " + " -> ".join(chain))
+        elif show_sources:
+            # Find the file that immediately imported the dependency (second to last element in chain)
+            sources = set()
+            for chain in result.import_chains.get(pkg, []):
+                if len(chain) >= 2:
+                    sources.add(chain[-2])
+            console.print(f"  - [cyan]{pkg}[/cyan]")
+            console.print("    (imported by: " + ", ".join(sorted(list(sources))) + ")")
         else:
             console.print(f"  - {pkg}")
 

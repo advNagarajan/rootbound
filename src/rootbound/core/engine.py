@@ -10,7 +10,15 @@ from rootbound.core.stdlib_list import is_stdlib
 class RootboundEngine:
     def __init__(self, target_path: str, is_directory: bool = False):
         self.target_path = Path(target_path).resolve()
-        self.project_root = self.target_path if is_directory else self.target_path.parent
+        
+        # Traverse upwards to find project root by identifying git/project anchor files
+        start_dir = self.target_path if is_directory else self.target_path.parent
+        self.project_root = start_dir
+        for parent in [start_dir] + list(start_dir.parents):
+            if (parent / ".git").exists() or (parent / "pyproject.toml").exists() or (parent / "requirements.txt").exists():
+                self.project_root = parent
+                break
+                
         self.is_directory = is_directory
         self.visited_files: Set[Path] = set()
         self.top_level_packages: Set[str] = set()
@@ -64,6 +72,9 @@ class RootboundEngine:
                             init_py = curr_dir / "__init__.py"
                             if init_py.exists():
                                 self.trace_local_file(init_py, current_chain + [file_path.name])
+                            else:
+                                for py_file in curr_dir.rglob("*.py"):
+                                    self.trace_local_file(py_file, current_chain + [file_path.name])
                             
                             # Check if individual imports inside node.names are sub-files/dirs
                             for alias in node.names:
@@ -71,8 +82,13 @@ class RootboundEngine:
                                 sub_dir = curr_dir / alias.name
                                 if sub_py.exists():
                                     self.trace_local_file(sub_py, current_chain + [file_path.name])
-                                elif sub_dir.is_dir() and (sub_dir / "__init__.py").exists():
-                                    self.trace_local_file(sub_dir / "__init__.py", current_chain + [file_path.name])
+                                elif sub_dir.is_dir():
+                                    sub_init = sub_dir / "__init__.py"
+                                    if sub_init.exists():
+                                        self.trace_local_file(sub_init, current_chain + [file_path.name])
+                                    else:
+                                        for py_file in sub_dir.rglob("*.py"):
+                                            self.trace_local_file(py_file, current_chain + [file_path.name])
                     else:
                         # e.g., from . import db
                         for alias in node.names:
@@ -84,30 +100,69 @@ class RootboundEngine:
                                 init_py = resolved_dir / "__init__.py"
                                 if init_py.exists():
                                     self.trace_local_file(init_py, current_chain + [file_path.name])
+                                else:
+                                    for py_file in resolved_dir.rglob("*.py"):
+                                        self.trace_local_file(py_file, current_chain + [file_path.name])
                 elif node.module:
                     self._process_import_string(node.module, current_chain + [file_path.name], file_dir)
 
     def _process_import_string(self, full_import_str: str, chain: List[str], file_dir: Path):
-        root_module = full_import_str.split('.')[0]
+        parts = full_import_str.split('.')
+        root_module = parts[0]
         if not root_module or is_stdlib(root_module):
             return
 
-        # Check in the current file directory or the project root
+        # 1. Resolve the path of the root module
         local_py_file = file_dir / f"{root_module}.py"
         local_dir = file_dir / root_module
         
-        # Fallback to project root if not in the current file dir
-        if not local_py_file.exists() and not (local_dir.is_dir() and (local_dir / "__init__.py").exists()):
+        if not local_py_file.exists() and not local_dir.is_dir():
             local_py_file = self.project_root / f"{root_module}.py"
             local_dir = self.project_root / root_module
 
+        # 2. If it is a local file, trace it directly
         if local_py_file.exists():
             self.trace_local_file(local_py_file, chain)
-        elif local_dir.is_dir() and (local_dir / "__init__.py").exists():
-            self.trace_local_file(local_dir / "__init__.py", chain)
+            return
+
+        # 3. If it is a directory, resolve sub-modules dynamically along the parts
+        if local_dir.is_dir():
+            current_path = local_dir
+            resolved = False
+            
+            # Walk down the sub-parts of the import (e.g., from app.models.db.job import Job)
+            for part in parts[1:]:
+                next_file = current_path / f"{part}.py"
+                next_dir = current_path / part
+                if next_file.exists():
+                    self.trace_local_file(next_file, chain)
+                    resolved = True
+                    break
+                elif next_dir.is_dir():
+                    current_path = next_dir
+                else:
+                    break
+            
+            if not resolved:
+                # If we walked the path and it's a directory, check for __init__.py
+                init_py = current_path / "__init__.py"
+                if init_py.exists():
+                    self.trace_local_file(init_py, chain)
+                else:
+                    # Only fallback to rglob if no specific submodules were specified in the import string
+                    # e.g., "import app" when app has no __init__.py
+                    if len(parts) == 1:
+                        for py_file in current_path.rglob("*.py"):
+                            self.trace_local_file(py_file, chain)
         else:
-            # External PyPI package leaf
+            # External PyPI package leaf: Map namespace packages (e.g. google.cloud.pubsub_v1 -> google-cloud-pubsub)
             pypi_target = self.normalize_pypi_name(root_module)
+            if pypi_target == "google" and len(parts) >= 3 and parts[1] == "cloud":
+                sub_pkg = parts[2]
+                pypi_target = f"google-cloud-{sub_pkg.replace('_', '-')}"
+            elif pypi_target == "google" and len(parts) >= 2 and parts[1] == "cloud":
+                pypi_target = "google-cloud"
+            
             self.top_level_packages.add(pypi_target)
             if pypi_target not in self.import_chains:
                 self.import_chains[pypi_target] = []
