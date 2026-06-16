@@ -1,0 +1,18 @@
+[project]
+name = "rootbound"
+version = "0.1.0"
+description = "Entrypoint-Driven Dependency Graph & Architecture Linter"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "tomlkit>=0.12.0",
+]
+
+[project.scripts]
+bound = "rootbound.cli.main:app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
