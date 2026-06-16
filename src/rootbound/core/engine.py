@@ -4,11 +4,49 @@ from pathlib import Path
 from typing import Set, Dict, List, Tuple
 
 from rootbound.core.models import ScanResult
-from rootbound.core.pypi_mapping import PYPI_MAPPING
+from rootbound.core.constants import DEFAULT_NAMESPACES, PYPI_MAPPING
 from rootbound.core.stdlib_list import is_stdlib
 
+class NamespaceResolver:
+    def __init__(self, project_root: Path, user_namespaces: Set[str] = None):
+        self.project_root = Path(project_root).resolve()
+        # Combine default vendor mappings with user configuration
+        self.known_namespaces = DEFAULT_NAMESPACES | (user_namespaces or set())
+
+    def resolve_import_to_package(self, import_str: str) -> str:
+        """
+        Populates and infers package names for any import path by cross-referencing 
+        the static registry and checking disk layouts for local file boundaries.
+        """
+        parts = import_str.split(".")
+        
+        # Phase 1: Check known multi-level namespaces (Static Registry)
+        if len(parts) >= 2:
+            two_layer = f"{parts[0]}.{parts[1]}"
+            if two_layer in self.known_namespaces:
+                # E.g., google.cloud.pubsub -> "google-cloud"
+                base_pkg = f"{parts[0]}-{parts[1]}"
+                return PYPI_MAPPING.get(base_pkg.lower(), base_pkg)
+
+        # Phase 2: Progressive Slicing (Dynamic Boundary Check)
+        current_path = self.project_root
+        for i, part in enumerate(parts):
+            file_candidate = current_path / f"{part}.py"
+            dir_candidate = current_path / part
+            
+            if file_candidate.exists() or (dir_candidate.is_dir() and (dir_candidate / "__init__.py").exists()):
+                current_path = dir_candidate if dir_candidate.is_dir() else current_path
+                continue
+            else:
+                # CRITICAL BOUNDARY FOUND: Local files stop here.
+                third_party_module = parts[i]
+                return PYPI_MAPPING.get(third_party_module.lower(), third_party_module)
+
+        # Fallback if the entire thing is local code
+        return PYPI_MAPPING.get(parts[0].lower(), parts[0])
+
 class RootboundEngine:
-    def __init__(self, target_path: str, is_directory: bool = False):
+    def __init__(self, target_path: str, is_directory: bool = False, custom_namespaces: Set[str] = None):
         self.target_path = Path(target_path).resolve()
         
         # Traverse upwards to find project root by identifying git/project anchor files
@@ -23,10 +61,14 @@ class RootboundEngine:
         self.visited_files: Set[Path] = set()
         self.top_level_packages: Set[str] = set()
         self.import_chains: Dict[str, List[List[str]]] = {}
+        self.resolver = NamespaceResolver(self.project_root, custom_namespaces)
 
     def normalize_pypi_name(self, root_module: str) -> str:
         name_lower = root_module.lower()
         return PYPI_MAPPING.get(name_lower, name_lower)
+
+    def resolve_package_identifier(self, full_import_str: str) -> str:
+        return self.resolver.resolve_import_to_package(full_import_str)
 
     def trace_local_file(self, file_path: Path, current_chain: List[str]):
         if file_path in self.visited_files or not file_path.exists():
@@ -155,13 +197,8 @@ class RootboundEngine:
                         for py_file in current_path.rglob("*.py"):
                             self.trace_local_file(py_file, chain)
         else:
-            # External PyPI package leaf: Map namespace packages (e.g. google.cloud.pubsub_v1 -> google-cloud-pubsub)
-            pypi_target = self.normalize_pypi_name(root_module)
-            if pypi_target == "google" and len(parts) >= 3 and parts[1] == "cloud":
-                sub_pkg = parts[2]
-                pypi_target = f"google-cloud-{sub_pkg.replace('_', '-')}"
-            elif pypi_target == "google" and len(parts) >= 2 and parts[1] == "cloud":
-                pypi_target = "google-cloud"
+            # Resolve PyPI package target name using static namespace patterns
+            pypi_target = self.resolve_package_identifier(full_import_str)
             
             self.top_level_packages.add(pypi_target)
             if pypi_target not in self.import_chains:
